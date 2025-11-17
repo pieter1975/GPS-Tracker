@@ -4,12 +4,10 @@
   <meta charset="UTF-8" />
   <title>GPS Tracker – ThingSpeak</title>
 
-  <!-- Leaflet CSS -->
+  <!-- Leaflet CSS (no integrity so it can't be blocked) -->
   <link
     rel="stylesheet"
     href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
-    crossorigin=""
   />
 
   <style>
@@ -111,6 +109,15 @@
       background: #6b7280;
     }
 
+    select {
+      background: #111827;
+      color: #e5e7eb;
+      border-radius: 999px;
+      border: 1px solid #4b5563;
+      padding: 0.2rem 0.6rem;
+      font-size: 0.78rem;
+    }
+
     a {
       color: #a5b4fc;
     }
@@ -139,6 +146,14 @@
         </div>
       </div>
       <div class="right">
+        <span class="label">Range:</span>
+        <select id="rangeSelect">
+          <option value="all">Last 200 points</option>
+          <option value="today">Today</option>
+          <option value="yesterday">Yesterday</option>
+          <option value="week">This week</option>
+        </select>
+
         <button id="playRouteBtn" class="btn">Play route</button>
         <button id="downloadKmlBtn" class="btn">Download KML</button>
         <button id="downloadGpxBtn" class="btn">Download GPX</button>
@@ -151,15 +166,13 @@
     </div>
   </div>
 
-  <!-- Leaflet JS -->
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-          integrity="sha256-VuZ8H5M5GZkXoLZSmHgwlHGawEq+y3OCAXoTrZ1Y0wY="
-          crossorigin=""></script>
+  <!-- Leaflet JS (no integrity so it can't be blocked) -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 
   <script>
     // ==== CONFIG ====
     const CHANNEL_ID = 879706;       // your public channel
-    const RESULTS = 200;             // number of recent points to show
+    const RESULTS = 200;             // number of recent points to request
     const REFRESH_MS = 15000;        // 15 seconds
     const MAX_JUMP_METERS = 80;      // ignore jumps bigger than this
 
@@ -188,12 +201,16 @@
     let playbackTimer = null;
     let playbackMarker = null;
 
-    const lastPointEl   = document.getElementById("lastPoint");
-    const lastUpdateEl  = document.getElementById("lastUpdate");
-    const distanceEl    = document.getElementById("distance");
-    const playRouteBtn  = document.getElementById("playRouteBtn");
+    // Current date range filter
+    let currentRange = "all";
+
+    const lastPointEl    = document.getElementById("lastPoint");
+    const lastUpdateEl   = document.getElementById("lastUpdate");
+    const distanceEl     = document.getElementById("distance");
+    const playRouteBtn   = document.getElementById("playRouteBtn");
     const downloadKmlBtn = document.getElementById("downloadKmlBtn");
     const downloadGpxBtn = document.getElementById("downloadGpxBtn");
+    const rangeSelect    = document.getElementById("rangeSelect");
 
     function formatTime(ts) {
       if (!ts) return "–";
@@ -309,6 +326,38 @@ ${trkpts}
       URL.revokeObjectURL(url);
     }
 
+    // Work out start/end dates for the selected range (local time)
+    function getRangeBounds(rangeKey) {
+      const now = new Date();
+      let start = null;
+      let end = null;
+
+      if (rangeKey === "all") {
+        return { start: null, end: null }; // no filter
+      }
+
+      if (rangeKey === "today") {
+        start = new Date(now);
+        start.setHours(0, 0, 0, 0);
+        end = now;
+      } else if (rangeKey === "yesterday") {
+        end = new Date();
+        end.setHours(0, 0, 0, 0); // midnight today
+        start = new Date(end);
+        start.setDate(start.getDate() - 1); // midnight yesterday
+      } else if (rangeKey === "week") {
+        // "This week" = from Monday 00:00 of current week
+        start = new Date(now);
+        const day = start.getDay(); // 0=Sun,1=Mon,...
+        const diffToMonday = (day + 6) % 7; // days since Monday
+        start.setDate(start.getDate() - diffToMonday);
+        start.setHours(0, 0, 0, 0);
+        end = now;
+      }
+
+      return { start, end };
+    }
+
     async function fetchData() {
       try {
         const response = await fetch(FEED_URL + "&cachebust=" + Date.now());
@@ -324,7 +373,7 @@ ${trkpts}
         feeds.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
 
         // Build list of raw points
-        const rawPoints = [];
+        let rawPoints = [];
         for (const f of feeds) {
           const lat = parseFloat(f.field1);
           const lon = parseFloat(f.field2);
@@ -340,6 +389,28 @@ ${trkpts}
 
         if (rawPoints.length === 0) {
           console.log("No valid GPS points in feed.");
+          return;
+        }
+
+        // Apply date range filter
+        const { start, end } = getRangeBounds(currentRange);
+        if (start || end) {
+          rawPoints = rawPoints.filter(p => {
+            const t = new Date(p.created_at);
+            if (start && t < start) return false;
+            if (end && t > end) return false;
+            return true;
+          });
+        }
+
+        if (rawPoints.length === 0) {
+          console.log("No points inside selected range.");
+          currentPoints = [];
+          distanceEl.textContent = "0.00 km";
+          lastPointEl.textContent = "–";
+          lastUpdateEl.textContent = "–";
+          if (trackLine) trackLine.setLatLngs([]);
+          if (lastMarker) lastMarker.setLatLng([0, 0]);
           return;
         }
 
@@ -432,6 +503,11 @@ ${trkpts}
       if (!currentPoints || currentPoints.length === 0) return;
       const gpx = buildGpx(currentPoints);
       downloadTextFile("gps_track_" + CHANNEL_ID + ".gpx", gpx);
+    });
+
+    rangeSelect.addEventListener("change", () => {
+      currentRange = rangeSelect.value;
+      fetchData(); // refetch + re-render using new range
     });
   </script>
 </body>
