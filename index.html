@@ -59,6 +59,21 @@
       justify-content: space-between;
       align-items: center;
       box-sizing: border-box;
+      gap: 1rem;
+    }
+
+    #statusBar .left {
+      display: flex;
+      flex-direction: column;
+      gap: 0.15rem;
+    }
+
+    #statusBar .right {
+      display: flex;
+      align-items: center;
+      gap: 0.35rem;
+      flex-wrap: wrap;
+      justify-content: flex-end;
     }
 
     #statusBar span.label {
@@ -81,12 +96,26 @@
       margin-left: 0.25rem;
     }
 
+    .btn {
+      border: none;
+      border-radius: 999px;
+      padding: 0.25rem 0.75rem;
+      font-size: 0.78rem;
+      background: #4b5563;
+      color: #e5e7eb;
+      cursor: pointer;
+      transition: background 0.15s ease;
+    }
+
+    .btn:hover {
+      background: #6b7280;
+    }
+
     a {
       color: #a5b4fc;
     }
   </style>
 </head>
-
 <body>
   <div id="app">
     <header>
@@ -99,11 +128,21 @@
     <div id="map"></div>
 
     <div id="statusBar">
-      <div>
-        <span class="label">Last point:</span>
-        <span id="lastPoint" class="value">–</span>
+      <div class="left">
+        <div>
+          <span class="label">Last point:</span>
+          <span id="lastPoint" class="value">–</span>
+        </div>
+        <div>
+          <span class="label">Distance (filtered):</span>
+          <span id="distance" class="value">–</span>
+        </div>
       </div>
-      <div>
+      <div class="right">
+        <button id="playRouteBtn" class="btn">Play route</button>
+        <button id="downloadKmlBtn" class="btn">Download KML</button>
+        <button id="downloadGpxBtn" class="btn">Download GPX</button>
+
         <span class="label">Refresh:</span>
         <span class="badge">15s</span>
         <span class="label" style="margin-left:0.5rem;">Updated:</span>
@@ -112,81 +151,199 @@
     </div>
   </div>
 
-  <!-- Leaflet JS (the missing part!) -->
-  <script
-    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-    integrity="sha256-o9N1j7kGStG3cI1Q9UuGc7QpVbQ+3C5p3p3H0aoWjvE="
-    crossorigin=""
-  ></script>
+  <!-- Leaflet JS -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+          integrity="sha256-VuZ8H5M5GZkXoLZSmHgwlHGawEq+y3OCAXoTrZ1Y0wY="
+          crossorigin=""></script>
 
-  <!-- Main App -->
   <script>
     // ==== CONFIG ====
-    const CHANNEL_ID = 879706;
-    const RESULTS = 200;
-    const REFRESH_MS = 15000;
-    const MAX_JUMP_METERS = 80;
+    const CHANNEL_ID = 879706;       // your public channel
+    const RESULTS = 200;             // number of recent points to show
+    const REFRESH_MS = 15000;        // 15 seconds
+    const MAX_JUMP_METERS = 80;      // ignore jumps bigger than this
 
     const FEED_URL =
       `https://api.thingspeak.com/channels/${CHANNEL_ID}/feeds.json?results=${RESULTS}`;
 
     // ==== MAP SETUP ====
     let map = L.map("map", {
-      center: [53.883, -1.62],
+      center: [53.883, -1.62], // default (roughly your area)
       zoom: 14
     });
 
     L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
       maxZoom: 19,
-      attribution: '&copy; OpenStreetMap contributors'
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
     }).addTo(map);
 
     let trackLine = null;
     let lastMarker = null;
     let hasFitBoundsOnce = false;
 
-    const lastPointEl = document.getElementById("lastPoint");
-    const lastUpdateEl = document.getElementById("lastUpdate");
+    // For distance / playback / exports
+    let currentPoints = [];  // {lat, lon, created_at} after filtering
+
+    // Playback state
+    let playbackTimer = null;
+    let playbackMarker = null;
+
+    const lastPointEl   = document.getElementById("lastPoint");
+    const lastUpdateEl  = document.getElementById("lastUpdate");
+    const distanceEl    = document.getElementById("distance");
+    const playRouteBtn  = document.getElementById("playRouteBtn");
+    const downloadKmlBtn = document.getElementById("downloadKmlBtn");
+    const downloadGpxBtn = document.getElementById("downloadGpxBtn");
 
     function formatTime(ts) {
       if (!ts) return "–";
       return ts.replace("T", " ").replace("Z", "");
     }
 
+    // Haversine distance in metres between two lat/lon points
     function distanceMeters(lat1, lon1, lat2, lon2) {
-      const R = 6371000;
+      const R = 6371000; // earth radius in m
       const toRad = deg => deg * Math.PI / 180;
       const dLat = toRad(lat2 - lat1);
       const dLon = toRad(lon2 - lon1);
       const a =
-        Math.sin(dLat / 2) ** 2 +
+        Math.sin(dLat / 2) * Math.sin(dLat / 2) +
         Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
-        Math.sin(dLon / 2) ** 2;
+        Math.sin(dLon / 2) * Math.sin(dLon / 2);
       const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
       return R * c;
+    }
+
+    function stopPlayback() {
+      if (playbackTimer !== null) {
+        clearInterval(playbackTimer);
+        playbackTimer = null;
+      }
+      if (playbackMarker) {
+        map.removeLayer(playbackMarker);
+        playbackMarker = null;
+      }
+    }
+
+    function startPlayback() {
+      stopPlayback();
+      if (!currentPoints || currentPoints.length === 0) return;
+
+      let idx = 0;
+      playbackMarker = L.circleMarker(
+        [currentPoints[0].lat, currentPoints[0].lon],
+        { radius: 6, color: "yellow" }
+      ).addTo(map);
+
+      playbackTimer = setInterval(() => {
+        idx++;
+        if (idx >= currentPoints.length) {
+          stopPlayback();
+          return;
+        }
+        const p = currentPoints[idx];
+        playbackMarker.setLatLng([p.lat, p.lon]);
+        map.panTo([p.lat, p.lon], { animate: true, duration: 0.3 });
+      }, 500); // move every 0.5 s
+    }
+
+    function buildKml(points) {
+      const coords = points
+        .map(p => `${p.lon},${p.lat},0`)
+        .join(" ");
+
+      return `<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <name>GPS Track ${CHANNEL_ID}</name>
+    <Placemark>
+      <name>Track</name>
+      <Style>
+        <LineStyle>
+          <color>ff0000ff</color>
+          <width>3</width>
+        </LineStyle>
+      </Style>
+      <LineString>
+        <tessellate>1</tessellate>
+        <coordinates>
+          ${coords}
+        </coordinates>
+      </LineString>
+    </Placemark>
+  </Document>
+</kml>`;
+    }
+
+    function buildGpx(points) {
+      const trkpts = points
+        .map(p => {
+          const t = p.created_at || "";
+          return `      <trkpt lat="${p.lat}" lon="${p.lon}">
+        <time>${t}</time>
+      </trkpt>`;
+        })
+        .join("\n");
+
+      return `<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="GPS Tracker"
+     xmlns="http://www.topografix.com/GPX/1/1">
+  <trk>
+    <name>GPS Track ${CHANNEL_ID}</name>
+    <trkseg>
+${trkpts}
+    </trkseg>
+  </trk>
+</gpx>`;
+    }
+
+    function downloadTextFile(filename, text, mimeType = "application/xml") {
+      const blob = new Blob([text], { type: mimeType });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
     }
 
     async function fetchData() {
       try {
         const response = await fetch(FEED_URL + "&cachebust=" + Date.now());
-        if (!response.ok) return;
+        if (!response.ok) {
+          console.error("ThingSpeak HTTP error", response.status);
+          return;
+        }
 
         const data = await response.json();
         const feeds = (data.feeds || []).slice();
 
+        // Sort by time just to be safe
         feeds.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
 
-        const rawPoints = feeds
-          .map(f => ({
-            lat: parseFloat(f.field1),
-            lon: parseFloat(f.field2),
-            created_at: f.created_at
-          }))
-          .filter(p => !isNaN(p.lat) && !isNaN(p.lon));
+        // Build list of raw points
+        const rawPoints = [];
+        for (const f of feeds) {
+          const lat = parseFloat(f.field1);
+          const lon = parseFloat(f.field2);
 
-        if (rawPoints.length === 0) return;
+          if (!isNaN(lat) && !isNaN(lon)) {
+            rawPoints.push({
+              lat,
+              lon,
+              created_at: f.created_at
+            });
+          }
+        }
 
-        // Remove unrealistic jumps
+        if (rawPoints.length === 0) {
+          console.log("No valid GPS points in feed.");
+          return;
+        }
+
+        // Filter out big jumps
         const points = [];
         for (let i = 0; i < rawPoints.length; i++) {
           const p = rawPoints[i];
@@ -195,20 +352,40 @@
           } else {
             const prev = points[points.length - 1];
             const d = distanceMeters(prev.lat, prev.lon, p.lat, p.lon);
-
             if (d <= MAX_JUMP_METERS) {
               points.push(p);
+            } else {
+              console.warn("Skipping jump of", d.toFixed(1), "m", prev, "->", p);
             }
           }
         }
 
-        if (points.length === 0) return;
+        if (points.length === 0) {
+          console.log("All points were filtered out as jumps.");
+          return;
+        }
+
+        currentPoints = points; // save globally for playback / exports
+
+        // Compute total distance
+        let totalMeters = 0;
+        for (let i = 1; i < points.length; i++) {
+          const a = points[i - 1];
+          const b = points[i];
+          totalMeters += distanceMeters(a.lat, a.lon, b.lat, b.lon);
+        }
+        const km = totalMeters / 1000.0;
+        distanceEl.textContent = km.toFixed(2) + " km";
 
         const latest = points[points.length - 1];
         const latLngs = points.map(p => [p.lat, p.lon]);
 
         if (!trackLine) {
-          trackLine = L.polyline(latLngs, { color: "red", weight: 3 }).addTo(map);
+          trackLine = L.polyline(latLngs, {
+            color: "red",
+            weight: 3
+          }).addTo(map);
+
           lastMarker = L.marker([latest.lat, latest.lon]).addTo(map);
 
           if (!hasFitBoundsOnce) {
@@ -221,17 +398,41 @@
           map.panTo([latest.lat, latest.lon], { animate: true, duration: 0.5 });
         }
 
-        lastPointEl.textContent = `${latest.lat.toFixed(6)}, ${latest.lon.toFixed(6)}`;
+        lastPointEl.textContent =
+          `${latest.lat.toFixed(6)}, ${latest.lon.toFixed(6)}`;
         lastUpdateEl.textContent = formatTime(latest.created_at);
-
       } catch (err) {
-        console.error("Fetch error:", err);
+        console.error("Error fetching ThingSpeak data:", err);
       }
     }
 
+    // Initial fetch
     fetchData();
-    setInterval(fetchData, REFRESH_MS);
-  </script>
 
+    // Periodic refresh
+    setInterval(fetchData, REFRESH_MS);
+
+    // Button handlers
+    playRouteBtn.addEventListener("click", () => {
+      if (playbackTimer) {
+        // tap again to stop
+        stopPlayback();
+      } else {
+        startPlayback();
+      }
+    });
+
+    downloadKmlBtn.addEventListener("click", () => {
+      if (!currentPoints || currentPoints.length === 0) return;
+      const kml = buildKml(currentPoints);
+      downloadTextFile("gps_track_" + CHANNEL_ID + ".kml", kml);
+    });
+
+    downloadGpxBtn.addEventListener("click", () => {
+      if (!currentPoints || currentPoints.length === 0) return;
+      const gpx = buildGpx(currentPoints);
+      downloadTextFile("gps_track_" + CHANNEL_ID + ".gpx", gpx);
+    });
+  </script>
 </body>
 </html>
