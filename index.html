@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>GPS Tracker – ThingSpeak</title>
+
+  <!-- Leaflet CSS -->
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+    crossorigin=""
+  />
+
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+        sans-serif;
+      background: #111827;
+      color: #e5e7eb;
+    }
+
+    #app {
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+    }
+
+    header {
+      padding: 0.75rem 1rem;
+      background: #4c1d95;
+      color: #f9fafb;
+      font-weight: 600;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 0.95rem;
+    }
+
+    header .right {
+      font-size: 0.8rem;
+      opacity: 0.9;
+    }
+
+    #map {
+      flex: 1;
+      width: 100%;
+    }
+
+    #statusBar {
+      padding: 0.5rem 1rem;
+      font-size: 0.8rem;
+      background: #111827;
+      border-top: 1px solid #1f2937;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      box-sizing: border-box;
+    }
+
+    #statusBar span.label {
+      color: #9ca3af;
+      margin-right: 0.25rem;
+    }
+
+    #statusBar span.value {
+      color: #e5e7eb;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+        "Liberation Mono", "Courier New", monospace;
+    }
+
+    #statusBar span.badge {
+      background: #374151;
+      padding: 0.15rem 0.5rem;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      color: #d1d5db;
+      margin-left: 0.25rem;
+    }
+
+    a {
+      color: #a5b4fc;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="app">
+    <header>
+      <div>GPS Tracker – ThingSpeak</div>
+      <div class="right">
+        Channel: <strong>879706</strong>
+      </div>
+    </header>
+
+    <div id="map"></div>
+
+    <div id="statusBar">
+      <div>
+        <span class="label">Last point:</span>
+        <span id="lastPoint" class="value">–</span>
+      </div>
+      <div>
+        <span class="label">Refresh:</span>
+        <span class="badge">15s</span>
+        <span class="label" style="margin-left:0.5rem;">Updated:</span>
+        <span id="lastUpdate" class="value">–</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Leaflet JS (the missing part!) -->
+  <script
+    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha256-o9N1j7kGStG3cI1Q9UuGc7QpVbQ+3C5p3p3H0aoWjvE="
+    crossorigin=""
+  ></script>
+
+  <!-- Main App -->
+  <script>
+    // ==== CONFIG ====
+    const CHANNEL_ID = 879706;
+    const RESULTS = 200;
+    const REFRESH_MS = 15000;
+    const MAX_JUMP_METERS = 80;
+
+    const FEED_URL =
+      `https://api.thingspeak.com/channels/${CHANNEL_ID}/feeds.json?results=${RESULTS}`;
+
+    // ==== MAP SETUP ====
+    let map = L.map("map", {
+      center: [53.883, -1.62],
+      zoom: 14
+    });
+
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    let trackLine = null;
+    let lastMarker = null;
+    let hasFitBoundsOnce = false;
+
+    const lastPointEl = document.getElementById("lastPoint");
+    const lastUpdateEl = document.getElementById("lastUpdate");
+
+    function formatTime(ts) {
+      if (!ts) return "–";
+      return ts.replace("T", " ").replace("Z", "");
+    }
+
+    function distanceMeters(lat1, lon1, lat2, lon2) {
+      const R = 6371000;
+      const toRad = deg => deg * Math.PI / 180;
+      const dLat = toRad(lat2 - lat1);
+      const dLon = toRad(lon2 - lon1);
+      const a =
+        Math.sin(dLat / 2) ** 2 +
+        Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+        Math.sin(dLon / 2) ** 2;
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      return R * c;
+    }
+
+    async function fetchData() {
+      try {
+        const response = await fetch(FEED_URL + "&cachebust=" + Date.now());
+        if (!response.ok) return;
+
+        const data = await response.json();
+        const feeds = (data.feeds || []).slice();
+
+        feeds.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+
+        const rawPoints = feeds
+          .map(f => ({
+            lat: parseFloat(f.field1),
+            lon: parseFloat(f.field2),
+            created_at: f.created_at
+          }))
+          .filter(p => !isNaN(p.lat) && !isNaN(p.lon));
+
+        if (rawPoints.length === 0) return;
+
+        // Remove unrealistic jumps
+        const points = [];
+        for (let i = 0; i < rawPoints.length; i++) {
+          const p = rawPoints[i];
+          if (points.length === 0) {
+            points.push(p);
+          } else {
+            const prev = points[points.length - 1];
+            const d = distanceMeters(prev.lat, prev.lon, p.lat, p.lon);
+
+            if (d <= MAX_JUMP_METERS) {
+              points.push(p);
+            }
+          }
+        }
+
+        if (points.length === 0) return;
+
+        const latest = points[points.length - 1];
+        const latLngs = points.map(p => [p.lat, p.lon]);
+
+        if (!trackLine) {
+          trackLine = L.polyline(latLngs, { color: "red", weight: 3 }).addTo(map);
+          lastMarker = L.marker([latest.lat, latest.lon]).addTo(map);
+
+          if (!hasFitBoundsOnce) {
+            map.fitBounds(trackLine.getBounds(), { padding: [30, 30] });
+            hasFitBoundsOnce = true;
+          }
+        } else {
+          trackLine.setLatLngs(latLngs);
+          lastMarker.setLatLng([latest.lat, latest.lon]);
+          map.panTo([latest.lat, latest.lon], { animate: true, duration: 0.5 });
+        }
+
+        lastPointEl.textContent = `${latest.lat.toFixed(6)}, ${latest.lon.toFixed(6)}`;
+        lastUpdateEl.textContent = formatTime(latest.created_at);
+
+      } catch (err) {
+        console.error("Fetch error:", err);
+      }
+    }
+
+    fetchData();
+    setInterval(fetchData, REFRESH_MS);
+  </script>
+
+</body>
+</html>
